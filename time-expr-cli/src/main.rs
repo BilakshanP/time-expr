@@ -6,7 +6,6 @@ use clap::Parser;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-use time_expr::parser;
 use time_expr::prelude::*;
 
 use cli::Cli;
@@ -14,8 +13,17 @@ use cli::Cli;
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // Parse --var flags into the initial environment.
+    let mut env = match cli.build_env() {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     if cli.is_repl() {
-        return repl(&cli);
+        return repl(&cli, &mut env);
     }
 
     let source = match cli.source() {
@@ -28,17 +36,14 @@ fn main() -> ExitCode {
 
     let input = source.text.trim();
 
-    // Parse as a program (supports variables and ;).
-    let program = match parser::parse_program_rich(input) {
+    let program = match parse_program(input) {
         Ok(prog) => prog,
-        Err(errs) => {
-            report(input, &source.name, errs, &mut std::io::stderr())
-                .expect("write diagnostics to stderr");
+        Err(e) => {
+            eprintln!("Error[{}]: {e}", source.name);
             return ExitCode::FAILURE;
         }
     };
 
-    let mut env = Env::new();
     match program.eval(&mut env) {
         Ok(Some(value)) => print_value(&value, &cli),
         Ok(None) => {}
@@ -51,7 +56,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn repl(cli: &Cli) -> ExitCode {
+fn repl(cli: &Cli, env: &mut Env) -> ExitCode {
     let mut rl = match DefaultEditor::new() {
         Ok(rl) => rl,
         Err(e) => {
@@ -59,9 +64,6 @@ fn repl(cli: &Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-
-    // Variables persist across REPL lines.
-    let mut env = Env::new();
 
     loop {
         match rl.readline("> ") {
@@ -86,7 +88,7 @@ fn repl(cli: &Cli) -> ExitCode {
                     }
                 };
 
-                match program.eval(&mut env) {
+                match program.eval(env) {
                     Ok(Some(value)) => print_value(&value, cli),
                     Ok(None) => {}
                     Err(e) => eprintln!("Error: {e}"),

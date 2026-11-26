@@ -1,0 +1,31 @@
+#!/usr/bin/env -S texpr -f
+# workweek.texpr — calculate remaining work hours for the week
+#
+# Usage (defaults: today_in=09:00, today_out=14:30):
+#   texpr --var today_in=09:00 --var today_out=14:30 -f ~/workweek.texpr
+#
+# Override with your actual times:
+#   texpr --var today_in=08:30 --var today_out=17:00 -f ~/workweek.texpr
+#
+# Tip: feed the current time from the shell:
+#   texpr --var today_in=09:00 --var today_out=$(date +%H:%M) -f ~/workweek.texpr
+
+# --- Weekly target --------------------------------------------------------
+$weekly_target = 40h
+
+# --- Hours already logged (Mon–Thu) --------------------------------------
+$mon = 17:30 - 09:00           # 8h30m
+$tue = 18:00 - 09:15           # 8h45m
+$wed = 17:15 - 08:45           # 8h30m
+$thu = 17:00 - 09:00           # 8h
+
+$logged = $mon + $tue + $wed + $thu
+
+# --- Today (Friday) — pass via --var today_in=HH:MM --var today_out=HH:MM
+$today = $today_out - $today_in
+
+# --- Result ---------------------------------------------------------------
+$total     = $logged + $today
+$remaining = $weekly_target - $total
+
+$remaining

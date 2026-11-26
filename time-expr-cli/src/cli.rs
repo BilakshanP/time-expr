@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser};
 
+use time_expr::ast::Env;
+use time_expr::parser::parse;
+use time_expr::value::Value;
+
 const AFTER_HELP: &str = "\
 LITERALS:
   TimePoint   HH:MM | HH:MM:SS | DD:HH:MM:SS         e.g. 08:00, 14:30:15, 1:14:30:00
@@ -15,12 +19,17 @@ OPERATORS (precedence high to low):
   *, /        Duration*Scalar, Scalar*Duration, Duration/Scalar, Duration/Duration (ratio)
   +, -        TimePoint-TimePoint=Duration, TimePoint+/-Duration, Duration+/-Duration
 
+VARIABLES & SCRIPTS:
+  $name = expr          Assign a value      e.g. $lunch = 1h
+  $name                 Use a variable      e.g. $work - $lunch
+  expr ; expr           Multiple statements (or use newlines in files)
+  # comment             Line comments
+
 EXAMPLES:
-  texpr '(17:48 - 10:10) + (16:41 - 08:19)'     # => 16h
-  texpr '2h15m + 45m'                           # => 3h
-  texpr '6h / 2h'                               # => 3  (ratio, a Scalar)
-  echo '23:00 + 3h' | texpr --stdin             # => 1:02:00:00
-  texpr '$x = 2h; $y = $x * 3; $y'              # => 6h (variables)
+  texpr '(17:48 - 10:10) + (16:41 - 08:19)'    # => 16h
+  texpr '$x = 2h; $y = $x * 3; $y'             # => 6h
+  texpr --var start=09:00 --var end=17:30 '$end - $start'  # => 8h30m
+  texpr -f workweek.texpr                       # run a script
   texpr                                         # enter REPL mode
 
 NOTE: Use single quotes around expressions containing $variables to
@@ -46,6 +55,13 @@ prevent shell expansion (bash/zsh expand $x in double quotes).
 pub struct Cli {
     #[command(flatten)]
     pub input: Input,
+
+    /// Pre-set a variable before evaluation: --var name=EXPR.
+    ///
+    /// The EXPR is parsed as a single expression (e.g. 2h30m, 09:00, 3.5).
+    /// Can be repeated: --var start=09:00 --var end=17:30.
+    #[arg(long = "var", value_name = "NAME=EXPR")]
+    pub vars: Vec<String>,
 
     /// Emit the raw debug representation of the result instead of its display form.
     #[arg(short, long)]
@@ -98,6 +114,34 @@ impl Cli {
     /// True when no input source was given — the user wants a REPL.
     pub fn is_repl(&self) -> bool {
         self.input.expr.is_none() && !self.input.stdin && self.input.file.is_none()
+    }
+
+    /// Parse `--var` flags into an [`Env`], returning an error message on
+    /// malformed or unparseable entries.
+    pub fn build_env(&self) -> Result<Env, String> {
+        let mut env = Env::new();
+        for entry in &self.vars {
+            let (name, expr_str) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("--var: expected NAME=EXPR, got '{entry}'"))?;
+
+            let name = name.trim();
+            let expr_str = expr_str.trim();
+
+            if name.is_empty() {
+                return Err(format!("--var: empty variable name in '{entry}'"));
+            }
+
+            let expr = parse(expr_str)
+                .map_err(|e| format!("--var {name}: {e}"))?;
+
+            let value: Value = expr
+                .eval(&env)
+                .map_err(|e| format!("--var {name}: {e}"))?;
+
+            env.set(name.to_string(), value);
+        }
+        Ok(env)
     }
 
     /// Resolve the chosen input source into its text, enforcing `max_size`.

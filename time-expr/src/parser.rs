@@ -37,22 +37,50 @@ use crate::{
 type Extra<'src> = extra::Err<Rich<'src, char>>;
 
 // =========================================================================
+// Comment stripping
+// =========================================================================
+
+/// Strip `#` line comments and normalize newlines to `;` for the program
+/// parser.
+///
+/// Each line's comment (from `#` to end of line) is removed, and blank /
+/// comment-only lines are dropped. Remaining lines are joined with ` ; ` so
+/// the program parser's existing `;`-separation handles both semicolons and
+/// line breaks as statement separators.
+pub fn strip_comments(src: &str) -> String {
+    src.lines()
+        .map(|line| {
+            match line.find('#') {
+                Some(pos) => &line[..pos],
+                None => line,
+            }
+            .trim()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ; ")
+}
+
+// =========================================================================
 // Public API — single expression
 // =========================================================================
 
 /// Parse a complete source string into an [`Expr`] tree (single expression).
 ///
 /// For programs with variables and `;`, use [`parse_program`] instead.
+/// Line comments (`# ...`) are stripped before parsing.
 pub fn parse(src: &str) -> Result<Expr, ParseError> {
-    parse_rich(src).map_err(collapse_errors)
+    let clean = strip_comments(src);
+    parse_rich(&clean).map_err(collapse_errors)
 }
 
 /// Parse a source string into an [`Expr`], returning span-rich errors.
 pub fn parse_rich(src: &str) -> Result<Expr, Vec<Rich<'static, char>>> {
+    let clean = strip_comments(src);
     expr_parser()
         .then_ignore(end())
         .padded()
-        .parse(src)
+        .parse(&clean)
         .into_result()
         .map_err(|errs| errs.into_iter().map(|e| e.into_owned()).collect())
 }
@@ -62,14 +90,17 @@ pub fn parse_rich(src: &str) -> Result<Expr, Vec<Rich<'static, char>>> {
 // =========================================================================
 
 /// Parse a source string into a [`Program`] (statements separated by `;`).
+/// Line comments (`# ...`) are stripped before parsing.
 pub fn parse_program(src: &str) -> Result<Program, ParseError> {
-    parse_program_rich(src).map_err(collapse_errors)
+    let clean = strip_comments(src);
+    parse_program_rich(&clean).map_err(collapse_errors)
 }
 
 /// Parse a source string into a [`Program`], returning span-rich errors.
 pub fn parse_program_rich(src: &str) -> Result<Program, Vec<Rich<'static, char>>> {
+    let clean = strip_comments(src);
     program_parser()
-        .parse(src)
+        .parse(&clean)
         .into_result()
         .map_err(|errs| errs.into_iter().map(|e| e.into_owned()).collect())
 }
@@ -589,5 +620,46 @@ mod tests {
                 .to_string(),
             "5h"
         );
+    }
+
+    // --- comments --------------------------------------------------------
+
+    #[test]
+    fn line_comment_stripped() {
+        assert_eq!(eval_str("2h + 3h # this is a comment"), "5h");
+    }
+
+    #[test]
+    fn full_line_comment_in_program() {
+        let src = "\
+# Calculate total hours
+$x = 2h + 3h
+# Double it
+$y = $x * 2
+$y";
+        assert_eq!(prog_eval(src), "10h");
+    }
+
+    #[test]
+    fn inline_and_full_line_comments() {
+        let src = "$x = 8h # workday\n$x - 1h # minus lunch";
+        assert_eq!(prog_eval(src), "7h");
+    }
+
+    #[test]
+    fn comment_only_lines_skipped() {
+        let src = "# just a comment\n2h + 3h";
+        assert_eq!(prog_eval(src), "5h");
+    }
+
+    // --- multiline scripts -----------------------------------------------
+
+    #[test]
+    fn multiline_script_newlines_as_separators() {
+        let src = "\
+$start = 09:00
+$end = 17:30
+$end - $start";
+        assert_eq!(prog_eval(src), "8h30m");
     }
 }
