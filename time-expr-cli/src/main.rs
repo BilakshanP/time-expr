@@ -6,6 +6,7 @@ use clap::Parser;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+use time_expr::parser;
 use time_expr::prelude::*;
 
 use cli::Cli;
@@ -27,8 +28,9 @@ fn main() -> ExitCode {
 
     let input = source.text.trim();
 
-    let expr = match parse_rich(input) {
-        Ok(expr) => expr,
+    // Parse as a program (supports variables and ;).
+    let program = match parser::parse_program_rich(input) {
+        Ok(prog) => prog,
         Err(errs) => {
             report(input, &source.name, errs, &mut std::io::stderr())
                 .expect("write diagnostics to stderr");
@@ -36,15 +38,16 @@ fn main() -> ExitCode {
         }
     };
 
-    let value = match expr.eval() {
-        Ok(v) => v,
+    let mut env = Env::new();
+    match program.eval(&mut env) {
+        Ok(Some(value)) => print_value(&value, &cli),
+        Ok(None) => {}
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::FAILURE;
         }
-    };
+    }
 
-    print_value(&value, &cli);
     ExitCode::SUCCESS
 }
 
@@ -56,6 +59,9 @@ fn repl(cli: &Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Variables persist across REPL lines.
+    let mut env = Env::new();
 
     loop {
         match rl.readline("> ") {
@@ -72,27 +78,22 @@ fn repl(cli: &Cli) -> ExitCode {
 
                 let _ = rl.add_history_entry(&line);
 
-                let expr = match parse(input) {
-                    Ok(expr) => expr,
+                let program = match parse_program(input) {
+                    Ok(prog) => prog,
                     Err(e) => {
                         eprintln!("Error: {e}");
                         continue;
                     }
                 };
 
-                match expr.eval() {
-                    Ok(value) => print_value(&value, cli),
+                match program.eval(&mut env) {
+                    Ok(Some(value)) => print_value(&value, cli),
+                    Ok(None) => {}
                     Err(e) => eprintln!("Error: {e}"),
                 }
             }
-            Err(ReadlineError::Interrupted) => {
-                // Ctrl-C: cancel current line, don't exit.
-                continue;
-            }
-            Err(ReadlineError::Eof) => {
-                // Ctrl-D: exit cleanly.
-                break;
-            }
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
             Err(e) => {
                 eprintln!("Error: {e}");
                 return ExitCode::FAILURE;

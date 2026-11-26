@@ -24,10 +24,10 @@ pub mod diagnostics;
 
 /// Common imports for consumers of the library.
 pub mod prelude {
-    pub use crate::ast::Expr;
+    pub use crate::ast::{Env, Expr, Program, Statement};
     pub use crate::error::{EvalError, ParseError, TimeExprError};
     pub use crate::op::BinOp;
-    pub use crate::parser::{parse, parse_rich};
+    pub use crate::parser::{parse, parse_program, parse_rich};
     pub use crate::value::Value;
 
     #[cfg(feature = "diagnostics")]

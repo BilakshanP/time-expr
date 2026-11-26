@@ -29,7 +29,7 @@ operators and the result type (`t` = TimePoint, `d` = Duration, `s` = Scalar;
 ```
 l\r   T          D               S
 T     (-)d       (+ -)t          na
-D     (+)t       (+ -)d, (/)s     (* /)d
+D     (+)t       (+ -)d, (/)s    (* /)d
 S     na         (*)d            (+ - * /)s
 ```
 
@@ -67,7 +67,7 @@ parentheses `( )` group sub-expressions. Whitespace is insignificant.
 # Install from the workspace
 cargo install --path time-expr-cli
 
-time-expr '(17:48 - 10:10) + (16:41 - 08:19)'   # => 16h
+time-expr '(17:48 - 10:10) + (16:41 - 08:19)'    # => 16h
 time-expr '2h15m + 45m'                          # => 3h
 time-expr '6h / 2h'                              # => 3   (ratio, a Scalar)
 echo '23:00 + 3h' | time-expr --stdin            # => 1:02:00:00

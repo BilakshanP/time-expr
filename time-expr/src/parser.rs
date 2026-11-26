@@ -1,13 +1,20 @@
-//! Parser: source text -> [`Expr`] tree.
+//! Parser: source text -> [`Expr`] tree or [`Program`].
 //!
 //! Grammar (whitespace-insensitive around tokens):
 //!
 //! ```text
+//! program = statement (";" statement)* ";"?
+//! statement = assign | expr
+//! assign  = "$" ident "=" expr
+//!
 //! expr    = sum
 //! sum     = product (("+" | "-") product)*
-//! product = atom    (("*" | "/") atom)*
-//! atom    = literal | "(" expr ")"
+//! product = unary   (("*" | "/") unary)*
+//! unary   = atom | "-" unary
+//! atom    = literal | var_ref | "(" expr ")"
+//! var_ref = "$" ident
 //! literal = duration | timepoint | scalar
+//! ident   = [a-zA-Z_][a-zA-Z0-9_]*
 //! ```
 //!
 //! Literals are disambiguated by shape:
@@ -20,7 +27,7 @@
 use chumsky::{error::Rich, prelude::*};
 
 use crate::{
-    ast::Expr,
+    ast::{Expr, Program, Statement},
     error::ParseError,
     helpers::{checked_dhms_to_seconds, HOURS_PER_DAY, MINUTES_PER_HOUR, SECONDS_PER_MINUTE},
     op::{BinOp, UnaryOp},
@@ -29,40 +36,49 @@ use crate::{
 
 type Extra<'src> = extra::Err<Rich<'src, char>>;
 
-/// Parse a complete source string into an [`Expr`] tree.
+// =========================================================================
+// Public API — single expression
+// =========================================================================
+
+/// Parse a complete source string into an [`Expr`] tree (single expression).
 ///
-/// Collapses chumsky's diagnostics into a [`ParseError`] holding the reported
-/// problems as messages. The parser stops at the first error (no recovery is
-/// configured), so this is normally a single message. For span-aware reporting
-/// (e.g. via the `diagnostics` feature), use [`parse_rich`] instead, which
-/// preserves the full error set and their spans.
+/// For programs with variables and `;`, use [`parse_program`] instead.
 pub fn parse(src: &str) -> Result<Expr, ParseError> {
-    parse_rich(src).map_err(|errs| {
-        if errs.is_empty() {
-            ParseError::unexpected_eof()
-        } else {
-            ParseError::new(errs.iter().map(|e| e.to_string()))
-        }
-    })
+    parse_rich(src).map_err(collapse_errors)
 }
 
-/// Parse a source string, returning the full set of chumsky [`Rich`] errors on
-/// failure (with spans intact) so callers can render rich diagnostics.
-///
-/// The returned errors are `'static` (owned), so they outlive `src`.
+/// Parse a source string into an [`Expr`], returning span-rich errors.
 pub fn parse_rich(src: &str) -> Result<Expr, Vec<Rich<'static, char>>> {
     expr_parser()
+        .then_ignore(end())
+        .padded()
         .parse(src)
         .into_result()
         .map_err(|errs| errs.into_iter().map(|e| e.into_owned()).collect())
 }
 
+// =========================================================================
+// Public API — program (statements + variables)
+// =========================================================================
+
+/// Parse a source string into a [`Program`] (statements separated by `;`).
+pub fn parse_program(src: &str) -> Result<Program, ParseError> {
+    parse_program_rich(src).map_err(collapse_errors)
+}
+
+/// Parse a source string into a [`Program`], returning span-rich errors.
+pub fn parse_program_rich(src: &str) -> Result<Program, Vec<Rich<'static, char>>> {
+    program_parser()
+        .parse(src)
+        .into_result()
+        .map_err(|errs| errs.into_iter().map(|e| e.into_owned()).collect())
+}
+
+// =========================================================================
+// Public API — reusable parser handle
+// =========================================================================
+
 /// A reusable, boxed expression parser.
-///
-/// [`parse`]/[`parse_rich`] rebuild the combinator tree on every call, which is
-/// fine for one-shot use but wasteful in a loop. A long-lived consumer such as
-/// a REPL should build the parser once with [`parser`] and run it per line via
-/// [`run`], avoiding repeated construction.
 pub type ExprParser<'src> = Boxed<'src, 'src, &'src str, Expr, Extra<'src>>;
 
 /// Build the expression parser once, as a reusable boxed handle.
@@ -73,35 +89,43 @@ pub type ExprParser<'src> = Boxed<'src, 'src, &'src str, Expr, Extra<'src>>;
 ///
 /// let p = parser();
 /// for line in ["2h + 3h", "6h / 2h"] {
-///     let value = run(&p, line).unwrap().eval().unwrap();
+///     let value = run(&p, line).unwrap().eval(&Default::default()).unwrap();
 ///     println!("{value}");
 /// }
 /// ```
 pub fn parser<'src>() -> ExprParser<'src> {
-    expr_parser().boxed()
+    expr_parser().then_ignore(end()).padded().boxed()
 }
 
 /// Run a prebuilt [`parser`] over one input, collapsing errors into a
 /// [`ParseError`] (same contract as [`parse`]).
 pub fn run<'a>(parser: &ExprParser<'a>, src: &'a str) -> Result<Expr, ParseError> {
-    parser.parse(src).into_result().map_err(|errs| {
-        if errs.is_empty() {
-            ParseError::unexpected_eof()
-        } else {
-            ParseError::new(errs.iter().map(|e| e.to_string()))
-        }
-    })
+    parser
+        .parse(src)
+        .into_result()
+        .map_err(|errs| collapse_errors(errs.into_iter().map(|e| e.into_owned()).collect()))
 }
 
-/// The top-level expression parser, trimming surrounding whitespace and
-/// requiring the whole input to be consumed.
-fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
+// =========================================================================
+// Error collapsing helper
+// =========================================================================
+
+fn collapse_errors(errs: Vec<Rich<'static, char>>) -> ParseError {
+    if errs.is_empty() {
+        ParseError::unexpected_eof()
+    } else {
+        ParseError::new(errs.iter().map(|e| e.to_string()))
+    }
+}
+
+// =========================================================================
+// Expression parser (the core recursive grammar)
+// =========================================================================
+
+fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> + Clone {
     recursive(|expr| {
         // --- primitive: a bounded, overflow-checked unsigned integer -----
 
-        // A run of one or more ASCII digits, parsed to i64. Unlike
-        // `text::int`, this accepts leading zeros (e.g. `08`), which timepoint
-        // clock fields require. Overflowing i64 is a clean error, not a panic.
         let uint = one_of('0'..='9')
             .repeated()
             .at_least(1)
@@ -113,8 +137,6 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
 
         // --- scalar ------------------------------------------------------
 
-        // An integer or decimal number, e.g. `3` or `2.5`. Parsed to f64 via a
-        // fallible map so a malformed/huge literal errors instead of panicking.
         let digits = one_of('0'..='9').repeated().at_least(1);
         let scalar = digits
             .clone()
@@ -128,15 +150,11 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
 
         // --- duration ----------------------------------------------------
 
-        // A `<number><unit>` chunk such as `2h`, parsed to its i64 magnitude.
         let unit_part = {
             let uint = uint.clone();
             move |unit: char| uint.clone().then_ignore(just(unit))
         };
 
-        // Optional leading '-' then at least one of d/h/m/s in order, each
-        // optional. e.g. `1d2h3m4s`, `5h`, `-2h30m`, `0s`. Component combination
-        // is overflow-checked.
         let duration = just('-')
             .or_not()
             .then(
@@ -147,8 +165,6 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
                     .then(unit_part('s').or_not()),
             )
             .try_map(|(sign, (((d, h), m), s)), span| {
-                // Require at least one component so a bare number isn't a
-                // zero-length duration.
                 if d.is_none() && h.is_none() && m.is_none() && s.is_none() {
                     return Err(Rich::custom(span, "empty duration"));
                 }
@@ -172,17 +188,11 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
 
         // --- timepoint ---------------------------------------------------
 
-        // A single colon-separated field: optional '-' then digits, as i64.
         let field = just('-')
             .or_not()
             .then(uint.clone())
             .map(|(sign, n)| if sign.is_some() { -n } else { n });
 
-        // 2, 3, or 4 colon-separated fields. Structural parse only (always
-        // succeeds for a well-shaped field list); range validation is applied
-        // via `validate` *after* `choice` commits to this shape, so an
-        // out-of-range value reports a precise error instead of being
-        // out-competed by the scalar branch inside `choice`.
         let timepoint = field
             .separated_by(just(':'))
             .at_least(2)
@@ -193,11 +203,9 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
                     [h, m] => (0, *h, *m, 0),
                     [h, m, s] => (0, *h, *m, *s),
                     [d, h, m, s] => (*d, *h, *m, *s),
-                    // at_least(2)/at_most(4) guarantees 2..=4 fields.
                     _ => unreachable!("timepoint field count is bounded to 2..=4"),
                 };
 
-                // Hours/mins/secs within a day must be canonical; day is free.
                 let hours_max = HOURS_PER_DAY as i64;
                 let mins_max = MINUTES_PER_HOUR as i64;
                 let secs_max = SECONDS_PER_MINUTE as i64;
@@ -218,8 +226,6 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
                     ));
                 }
 
-                // On a range error we still return a (wrapped) value so parsing
-                // continues; the emitted error fails the overall parse anyway.
                 Value::TimePoint(crate::value::TimePoint::from_dhms_normalized(
                     day,
                     h.rem_euclid(hours_max) as u32,
@@ -228,20 +234,25 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
                 ))
             });
 
+        // --- variable reference ------------------------------------------
+
+        let var_ref = just('$')
+            .ignore_then(text::ident())
+            .map(|name: &str| Expr::Var(name.to_string()));
+
         // Order matters: timepoint (colons) and duration (unit letters) are
         // tried before scalar (a bare number), the fallback shape.
         let literal = choice((timepoint, duration, scalar)).map(Expr::Literal);
 
         // --- atoms, grouping, precedence ---------------------------------
 
-        let atom = literal.or(expr.delimited_by(just('('), just(')'))).padded();
+        let atom = literal
+            .or(var_ref)
+            .or(expr.delimited_by(just('('), just(')')))
+            .padded();
 
         let op = |c: char, binop: BinOp| just(c).padded().to(binop);
 
-        // unary: either an atom directly, or a prefix `-` applied to a unary.
-        // Trying `atom` first lets a signed-day timepoint literal (`-1:23:00:00`,
-        // whose leading `-` belongs to the day field) win before the `-` is
-        // interpreted as a negation operator. Binds tighter than `*`/`/`.
         let unary = recursive(|unary| {
             atom.clone().or(just('-')
                 .padded()
@@ -249,7 +260,6 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
                 .map(|operand| Expr::unary(UnaryOp::Neg, operand)))
         });
 
-        // product: * and / bind tighter than + and -; left-associative.
         let product = unary.clone().foldl(
             choice((op('*', BinOp::Mul), op('/', BinOp::Div)))
                 .then(unary)
@@ -257,7 +267,6 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
             |lhs, (binop, rhs)| Expr::binary(binop, lhs, rhs),
         );
 
-        // sum: + and -; left-associative.
         product.clone().foldl(
             choice((op('+', BinOp::Add), op('-', BinOp::Sub)))
                 .then(product)
@@ -265,22 +274,60 @@ fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> {
             |lhs, (binop, rhs)| Expr::binary(binop, lhs, rhs),
         )
     })
-    .then_ignore(end())
-    .padded()
 }
+
+// =========================================================================
+// Program parser (statements + variables + semicolons)
+// =========================================================================
+
+fn program_parser<'src>() -> impl Parser<'src, &'src str, Program, Extra<'src>> {
+    let expr = expr_parser();
+
+    // $ident = expr
+    let assign = just('$')
+        .ignore_then(text::ident())
+        .then_ignore(just('=').padded())
+        .then(expr.clone())
+        .map(|(name, e): (&str, Expr)| Statement::Assign {
+            name: name.to_string(),
+            expr: e,
+        });
+
+    // A statement is either an assignment or a bare expression.
+    // Try assign first since `$x = ...` starts with `$` which var_ref would
+    // also match; chumsky backtracks if the `= expr` part fails.
+    let stmt = assign.or(expr.map(Statement::Expr));
+
+    stmt.separated_by(just(';').padded())
+        .allow_trailing()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .map(|statements| Program { statements })
+        .then_ignore(end())
+        .padded()
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::Env;
     use crate::value::Value;
 
     // Parse then evaluate, returning the resulting Value as a string via Display.
     fn eval_str(src: &str) -> String {
-        parse(src).unwrap().eval().unwrap().to_string()
+        parse(src)
+            .unwrap()
+            .eval(&Env::new())
+            .unwrap()
+            .to_string()
     }
 
     fn parsed_value(src: &str) -> Value {
-        parse(src).unwrap().eval().unwrap()
+        parse(src).unwrap().eval(&Env::new()).unwrap()
     }
 
     // --- literals --------------------------------------------------------
@@ -327,7 +374,6 @@ mod tests {
 
     #[test]
     fn unary_binds_tighter_than_multiplication() {
-        // 3 * -2h = -6h, not -(3*2h) (same value here, but checks binding)
         assert_eq!(eval_str("3 * -2h"), "-6h");
     }
 
@@ -338,16 +384,17 @@ mod tests {
 
     #[test]
     fn binary_minus_not_confused_with_unary() {
-        // `8h - 24h` is subtraction, not `8h` then unary `-24h`.
         assert_eq!(eval_str("8h - 24h"), "-16h");
         assert_eq!(eval_str("8h-24h"), "-16h");
-        // mixed: binary minus followed by unary minus
         assert_eq!(eval_str("2h - -3h"), "5h");
     }
 
     #[test]
     fn unary_minus_on_timepoint_is_type_error() {
-        let err = parse("-(08:00)").unwrap().eval().unwrap_err();
+        let err = parse("-(08:00)")
+            .unwrap()
+            .eval(&Env::new())
+            .unwrap_err();
         assert_eq!(
             err,
             crate::error::EvalError::InvalidUnaryOperation {
@@ -359,19 +406,16 @@ mod tests {
 
     #[test]
     fn multiplication_binds_tighter_than_addition() {
-        // 2h + 3h*2 = 2h + 6h = 8h  (scalar on the right)
         assert_eq!(eval_str("2h + 3h * 2"), "8h");
     }
 
     #[test]
     fn parens_override_precedence() {
-        // (2h + 3h) * 2 = 10h
         assert_eq!(eval_str("(2h + 3h) * 2"), "10h");
     }
 
     #[test]
     fn left_associative_subtraction() {
-        // 5h - 2h - 1h = 2h
         assert_eq!(eval_str("5h - 2h - 1h"), "2h");
     }
 
@@ -384,7 +428,6 @@ mod tests {
 
     #[test]
     fn nested_timepoint_expression() {
-        // ( 17:48 - 10:10 ) + ( 16:41 - 08:19 ) = 16h
         assert_eq!(eval_str("(17:48 - 10:10) + (16:41 - 08:19)"), "16h");
     }
 
@@ -403,7 +446,6 @@ mod tests {
 
     #[test]
     fn out_of_range_timepoint_reports_precise_field() {
-        // The offending field is named, not a misleading "found ':'".
         let err = parse("25:00").unwrap_err();
         assert!(
             err.messages
@@ -425,8 +467,6 @@ mod tests {
 
     #[test]
     fn parse_error_carries_messages() {
-        // The error aggregates one message per reported problem (at least one),
-        // each a non-empty rendered reason.
         let err = parse("2h +").unwrap_err();
         assert!(!err.is_empty());
         assert_eq!(err.len(), err.messages.len());
@@ -437,48 +477,117 @@ mod tests {
 
     #[test]
     fn display_output_round_trips() {
-        // Every string the evaluator can emit must be valid input that parses
-        // and evaluates back to an equal value.
         for src in [
-            "16h", "-16h", "0s", "2h15m", "1d2h3m4s", "-2h30m", "-1d",
-            "08:00", "08:00:30", "1:14:30:00", "-1:23:00:00", "3", "-2.5",
+            "16h", "-16h", "0s", "2h15m", "1d2h3m4s", "-2h30m", "-1d", "08:00", "08:00:30",
+            "1:14:30:00", "-1:23:00:00", "3", "-2.5",
         ] {
-            let v1 = parse(src).unwrap().eval().unwrap();
+            let v1 = parse(src).unwrap().eval(&Env::new()).unwrap();
             let shown = v1.to_string();
             let v2 = parse(&shown)
                 .unwrap_or_else(|e| panic!("re-parsing Display output {shown:?} failed: {e}"))
-                .eval()
+                .eval(&Env::new())
                 .unwrap();
             assert_eq!(v1, v2, "round-trip mismatch: {src:?} -> {shown:?}");
         }
     }
 
-    // --- overflow robustness: must error, never panic --------------------
+    // --- overflow robustness ---------------------------------------------
 
     #[test]
     fn oversized_number_errors_not_panics() {
-        // In i64 contexts (duration magnitude, timepoint field) an oversized
-        // number must report an error, never panic.
         assert!(parse("99999999999999999999d").is_err());
         assert!(parse("99999999999999999999:00").is_err());
     }
 
     #[test]
     fn oversized_bare_scalar_is_allowed() {
-        // A bare number is a Scalar (f64), which has range for huge magnitudes,
-        // so this parses rather than erroring. (Documents the i64-vs-f64 split.)
         assert!(parse("99999999999999999999").is_ok());
     }
 
     #[test]
     fn duration_component_overflow_errors() {
-        // Fits in i64 as a bare number, but *d means *86400, which overflows.
         assert!(parse("9000000000000000d").is_err());
     }
 
     #[test]
     fn large_but_valid_duration_parses() {
-        // ~1e11 seconds: large but well within i64, must succeed.
         assert_eq!(eval_str("1000000d"), "1000000d");
+    }
+
+    // --- variables and programs ------------------------------------------
+
+    fn prog_eval(src: &str) -> String {
+        let prog = parse_program(src).unwrap();
+        let mut env = Env::new();
+        prog.eval(&mut env).unwrap().unwrap().to_string()
+    }
+
+    #[test]
+    fn var_assign_and_ref() {
+        assert_eq!(prog_eval("$x = 2h; $x"), "2h");
+    }
+
+    #[test]
+    fn var_in_expression() {
+        assert_eq!(prog_eval("$x = 2h; $x + 3h"), "5h");
+    }
+
+    #[test]
+    fn chained_vars() {
+        assert_eq!(prog_eval("$x = 2h + 2h; $y = $x / 2; $y"), "2h");
+    }
+
+    #[test]
+    fn assignment_is_last_statement() {
+        // No trailing bare expression — assignment value is the result.
+        assert_eq!(prog_eval("$x = 2h + 2h; $y = $x / 2"), "2h");
+    }
+
+    #[test]
+    fn single_assignment() {
+        assert_eq!(prog_eval("$x = 5h"), "5h");
+    }
+
+    #[test]
+    fn trailing_semicolon() {
+        assert_eq!(prog_eval("$x = 5h;"), "5h");
+    }
+
+    #[test]
+    fn bare_expr_in_program() {
+        assert_eq!(prog_eval("2h + 3h"), "5h");
+    }
+
+    #[test]
+    fn undefined_variable_errors() {
+        let prog = parse_program("$x + 1h").unwrap();
+        let mut env = Env::new();
+        assert_eq!(
+            prog.eval(&mut env),
+            Err(crate::error::EvalError::UndefinedVariable {
+                name: "x".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn var_ref_in_single_expr_parse() {
+        // The single-expression parser should also handle $var.
+        let expr = parse("$x").unwrap();
+        let mut env = Env::new();
+        env.set("x".to_string(), Value::Scalar(42.0));
+        assert_eq!(expr.eval(&env).unwrap(), Value::Scalar(42.0));
+    }
+
+    #[test]
+    fn existing_parse_still_works() {
+        assert_eq!(
+            parse("2h + 3h")
+                .unwrap()
+                .eval(&Env::new())
+                .unwrap()
+                .to_string(),
+            "5h"
+        );
     }
 }

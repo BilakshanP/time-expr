@@ -58,6 +58,8 @@ pub enum EvalError {
     InvalidUnaryOperation { op: UnaryOp, operand: &'static str },
     /// Division by a zero `Scalar` or zero-length `Duration`.
     DivisionByZero,
+    /// Reference to a variable that has not been assigned.
+    UndefinedVariable { name: String },
 }
 
 impl fmt::Display for EvalError {
@@ -72,6 +74,9 @@ impl fmt::Display for EvalError {
                 "unary '{op}' is not defined on {operand}"
             ),
             EvalError::DivisionByZero => f.write_str("division by zero"),
+            EvalError::UndefinedVariable { name } => {
+                write!(f, "undefined variable '${name}'")
+            }
         }
     }
 }

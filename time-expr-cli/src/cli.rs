@@ -16,11 +16,15 @@ OPERATORS (precedence high to low):
   +, -        TimePoint-TimePoint=Duration, TimePoint+/-Duration, Duration+/-Duration
 
 EXAMPLES:
-  texpr '(17:48 - 10:10) + (16:41 - 08:19)'    # => 16h
+  texpr '(17:48 - 10:10) + (16:41 - 08:19)'     # => 16h
   texpr '2h15m + 45m'                           # => 3h
   texpr '6h / 2h'                               # => 3  (ratio, a Scalar)
   echo '23:00 + 3h' | texpr --stdin             # => 1:02:00:00
+  texpr '$x = 2h; $y = $x * 3; $y'              # => 6h (variables)
   texpr                                         # enter REPL mode
+
+NOTE: Use single quotes around expressions containing $variables to
+prevent shell expansion (bash/zsh expand $x in double quotes).
 ";
 
 /// time-expr: evaluate affine time expressions.
