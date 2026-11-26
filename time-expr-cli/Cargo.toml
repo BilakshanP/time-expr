@@ -12,3 +12,4 @@ path = "src/main.rs"
 [dependencies]
 time-expr = { workspace = true, features = ["diagnostics"] }
 clap = { version = "4", features = ["derive"] }
+rustyline = "19"

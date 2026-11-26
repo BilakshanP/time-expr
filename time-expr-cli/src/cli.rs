@@ -20,6 +20,7 @@ EXAMPLES:
   texpr '2h15m + 45m'                           # => 3h
   texpr '6h / 2h'                               # => 3  (ratio, a Scalar)
   echo '23:00 + 3h' | texpr --stdin             # => 1:02:00:00
+  texpr                                         # enter REPL mode
 ";
 
 /// time-expr: evaluate affine time expressions.
@@ -27,6 +28,9 @@ EXAMPLES:
 /// Combines TimePoints (clock instants), Durations (signed displacements), and
 /// Scalars under a type-checked algebra: e.g. `TimePoint - TimePoint` yields a
 /// Duration, but `TimePoint + TimePoint` is rejected.
+///
+/// When invoked with no arguments, starts an interactive REPL with history
+/// and line-editing support.
 #[derive(Parser)]
 #[command(
     name = "time-expr",
@@ -68,11 +72,12 @@ impl Source {
 }
 
 #[derive(Args)]
-#[group(required = true, multiple = false)]
+#[group(required = false, multiple = false)]
 pub struct Input {
     /// The expression to evaluate, e.g. "(17:48 - 10:10) + (16:41 - 08:19)".
     ///
     /// Expressions starting with '-' (e.g. "-24h") are accepted without '--'.
+    /// When omitted (and --stdin/--file not given), starts an interactive REPL.
     #[arg(allow_hyphen_values = true)]
     pub expr: Option<String>,
 
@@ -86,7 +91,14 @@ pub struct Input {
 }
 
 impl Cli {
+    /// True when no input source was given — the user wants a REPL.
+    pub fn is_repl(&self) -> bool {
+        self.input.expr.is_none() && !self.input.stdin && self.input.file.is_none()
+    }
+
     /// Resolve the chosen input source into its text, enforcing `max_size`.
+    ///
+    /// Panics if called in REPL mode (check [`is_repl`] first).
     pub fn source(&self) -> Result<Source, String> {
         let src = self.input.read()?;
 
