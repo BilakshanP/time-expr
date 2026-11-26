@@ -10,10 +10,10 @@ LITERALS:
   Scalar      a plain number                         e.g. 3, 2.5
 
 OPERATORS (precedence high to low):
+  ( )         grouping — overrides all precedence
   unary -     Negate a Duration or Scalar (e.g. -2h, -(5h - 2h))
   *, /        Duration*Scalar, Scalar*Duration, Duration/Scalar, Duration/Duration (ratio)
   +, -        TimePoint-TimePoint=Duration, TimePoint+/-Duration, Duration+/-Duration
-  ( )         grouping
 
 EXAMPLES:
   texpr '(17:48 - 10:10) + (16:41 - 08:19)'    # => 16h
