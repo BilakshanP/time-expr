@@ -10,6 +10,6 @@ name = "texpr"
 path = "src/main.rs"
 
 [dependencies]
-time-expr = { workspace = true, features = ["diagnostics"] }
+time-expr = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rustyline = "19"

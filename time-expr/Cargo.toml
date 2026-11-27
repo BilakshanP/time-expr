@@ -6,15 +6,8 @@ license.workspace = true
 repository.workspace = true
 description = "An affine time-algebra library and expression language (TimePoints, Durations, Scalars)."
 
-[dependencies]
-chumsky = { workspace = true }
-ariadne = { workspace = true, optional = true }
-
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-
-[features]
-diagnostics = ["dep:ariadne"]
 
 [[bench]]
 name = "bench"

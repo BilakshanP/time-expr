@@ -3,7 +3,8 @@
 //! Run with: `cargo bench -p time-expr`
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use time_expr::parser::{self, parse};
+use time_expr::ast::Env;
+use time_expr::parser::parse;
 use time_expr::value::{Duration, TimePoint, Value};
 
 // =========================================================================
@@ -27,7 +28,7 @@ fn chain_expr(n: usize) -> String {
 }
 
 // =========================================================================
-// Parse benchmarks — the chumsky combinator tree
+// Parse benchmarks
 // =========================================================================
 
 fn bench_parse(c: &mut Criterion) {
@@ -42,41 +43,15 @@ fn bench_parse(c: &mut Criterion) {
         ("mixed_ops", EXPR_MIXED_OPS),
         ("nested_parens", EXPR_NESTED_PARENS),
     ] {
-        group.bench_with_input(BenchmarkId::new("one_shot", name), expr, |b, src| {
+        group.bench_with_input(BenchmarkId::from_parameter(name), expr, |b, src| {
             b.iter(|| parse(black_box(src)).unwrap());
         });
     }
 
-    // Scaling: chain expressions of increasing length
     for n in [5, 10, 20, 50] {
         let expr = chain_expr(n);
-        group.bench_with_input(
-            BenchmarkId::new("chain", n),
-            &expr,
-            |b, src| {
-                b.iter(|| parse(black_box(src)).unwrap());
-            },
-        );
-    }
-
-    group.finish();
-}
-
-// =========================================================================
-// Parse with reusable parser — amortized cost
-// =========================================================================
-
-fn bench_parse_reuse(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parse_reuse");
-
-    for (name, expr) in [
-        ("simple_dur", EXPR_SIMPLE_DURATION),
-        ("two_subs", EXPR_TWO_SUBS),
-        ("chain_5", EXPR_CHAIN_5),
-    ] {
-        group.bench_with_input(BenchmarkId::new("run", name), expr, |b, src| {
-            let p = parser::parser();
-            b.iter(|| parser::run(&p, black_box(src)).unwrap());
+        group.bench_with_input(BenchmarkId::new("chain", n), &expr, |b, src| {
+            b.iter(|| parse(black_box(src)).unwrap());
         });
     }
 
@@ -89,6 +64,7 @@ fn bench_parse_reuse(c: &mut Criterion) {
 
 fn bench_eval(c: &mut Criterion) {
     let mut group = c.benchmark_group("eval");
+    let env = Env::new();
 
     for (name, expr_str) in [
         ("simple_dur", EXPR_SIMPLE_DURATION),
@@ -99,16 +75,15 @@ fn bench_eval(c: &mut Criterion) {
     ] {
         let tree = parse(expr_str).unwrap();
         group.bench_with_input(BenchmarkId::from_parameter(name), &tree, |b, tree| {
-            b.iter(|| black_box(tree).eval().unwrap());
+            b.iter(|| black_box(tree).eval(&env).unwrap());
         });
     }
 
-    // Scaling: chain expressions of increasing length
     for n in [5, 10, 20, 50] {
         let expr = chain_expr(n);
         let tree = parse(&expr).unwrap();
         group.bench_with_input(BenchmarkId::new("chain", n), &tree, |b, tree| {
-            b.iter(|| black_box(tree).eval().unwrap());
+            b.iter(|| black_box(tree).eval(&env).unwrap());
         });
     }
 
@@ -148,6 +123,7 @@ fn bench_display(c: &mut Criterion) {
 
 fn bench_end_to_end(c: &mut Criterion) {
     let mut group = c.benchmark_group("end_to_end");
+    let env = Env::new();
 
     for (name, expr) in [
         ("simple_dur", EXPR_SIMPLE_DURATION),
@@ -158,19 +134,18 @@ fn bench_end_to_end(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(name), expr, |b, src| {
             b.iter(|| {
                 let tree = parse(black_box(src)).unwrap();
-                let val = tree.eval().unwrap();
+                let val = tree.eval(&env).unwrap();
                 val.to_string()
             });
         });
     }
 
-    // Scaling
     for n in [10, 20, 50] {
         let expr = chain_expr(n);
         group.bench_with_input(BenchmarkId::new("chain", n), &expr, |b, src| {
             b.iter(|| {
                 let tree = parse(black_box(src)).unwrap();
-                let val = tree.eval().unwrap();
+                let val = tree.eval(&env).unwrap();
                 val.to_string()
             });
         });
@@ -181,5 +156,5 @@ fn bench_end_to_end(c: &mut Criterion) {
 
 // =========================================================================
 
-criterion_group!(benches, bench_parse, bench_parse_reuse, bench_eval, bench_display, bench_end_to_end);
+criterion_group!(benches, bench_parse, bench_eval, bench_display, bench_end_to_end);
 criterion_main!(benches);

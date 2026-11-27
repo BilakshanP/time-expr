@@ -10,8 +10,6 @@ repository = "https://github.com/bilakshanp/time-expr"
 
 [workspace.dependencies]
 time-expr = { path = "time-expr", version = "0.1.0" }
-chumsky = "0.13.0"
-ariadne = "0.6.0"
 
 [profile.release]
 lto = "fat"
