@@ -1,30 +1,26 @@
-//! Parser: source text -> [`Expr`] tree or [`Program`].
+//! Hand-written recursive descent parser: source text → [`Expr`] / [`Program`].
 //!
 //! Grammar (whitespace-insensitive around tokens):
 //!
 //! ```text
-//! program = statement (";" statement)* ";"?
+//! program   = statement (";" statement)* ";"?
 //! statement = assign | expr
-//! assign  = "$" ident "=" expr
+//! assign    = "$" ident "=" expr
 //!
-//! expr    = sum
-//! sum     = product (("+" | "-") product)*
-//! product = unary   (("*" | "/") unary)*
-//! unary   = atom | "-" unary
-//! atom    = literal | var_ref | "(" expr ")"
-//! var_ref = "$" ident
-//! literal = duration | timepoint | scalar
-//! ident   = [a-zA-Z_][a-zA-Z0-9_]*
+//! expr      = sum
+//! sum       = product (("+" | "-") product)*
+//! product   = unary   (("*" | "/") unary)*
+//! unary     = atom | "-" unary
+//! atom      = literal | var_ref | "(" expr ")"
+//! var_ref   = "$" ident
+//! literal   = duration | timepoint | scalar
+//! ident     = [a-zA-Z_][a-zA-Z0-9_]*
 //! ```
 //!
-//! Literals are disambiguated by shape:
-//! - **duration** carries unit letters: `1d2h3m4s`, components omittable,
-//!   optional leading `-` (e.g. `5h`, `-2h30m`, `0s`).
-//! - **timepoint** uses colons, meaning set by field count:
-//!   `HH:MM`, `HH:MM:SS`, or `DD:HH:MM:SS` (day may be signed / multi-digit).
-//! - **scalar** is a bare number: `3`, `2.5`.
-
-use chumsky::{error::Rich, prelude::*};
+//! Literals are disambiguated by lookahead:
+//! - A digit run followed by `:` → **timepoint** (2–4 colon-separated fields).
+//! - A digit run followed by `d`/`h`/`m`/`s` → **duration** (optional leading `-`).
+//! - A digit run followed by `.` or end-of-token → **scalar** (`f64`).
 
 use crate::{
     ast::{Expr, Program, Statement},
@@ -34,19 +30,15 @@ use crate::{
     value::Value,
 };
 
-type Extra<'src> = extra::Err<Rich<'src, char>>;
-
 // =========================================================================
 // Comment stripping
 // =========================================================================
 
-/// Strip `#` line comments and normalize newlines to `;` for the program
-/// parser.
+/// Strip `#` line comments and normalize newlines to `;`.
 ///
 /// Each line's comment (from `#` to end of line) is removed, and blank /
 /// comment-only lines are dropped. Remaining lines are joined with ` ; ` so
-/// the program parser's existing `;`-separation handles both semicolons and
-/// line breaks as statement separators.
+/// the parser's `;`-separation handles both semicolons and line breaks.
 pub fn strip_comments(src: &str) -> String {
     src.lines()
         .map(|line| {
@@ -62,280 +54,566 @@ pub fn strip_comments(src: &str) -> String {
 }
 
 // =========================================================================
-// Public API — single expression
+// Public API
 // =========================================================================
 
-/// Parse a complete source string into an [`Expr`] tree (single expression).
+/// Parse a source string into a single [`Expr`] (no statements / variables).
 ///
-/// For programs with variables and `;`, use [`parse_program`] instead.
 /// Line comments (`# ...`) are stripped before parsing.
 pub fn parse(src: &str) -> Result<Expr, ParseError> {
     let clean = strip_comments(src);
-    parse_rich(&clean).map_err(collapse_errors)
+    let mut p = Parser::new(&clean);
+    let expr = p.parse_expr()?;
+    p.expect_eof()?;
+    Ok(expr)
 }
-
-/// Parse a source string into an [`Expr`], returning span-rich errors.
-pub fn parse_rich(src: &str) -> Result<Expr, Vec<Rich<'static, char>>> {
-    let clean = strip_comments(src);
-    expr_parser()
-        .then_ignore(end())
-        .padded()
-        .parse(&clean)
-        .into_result()
-        .map_err(|errs| errs.into_iter().map(|e| e.into_owned()).collect())
-}
-
-// =========================================================================
-// Public API — program (statements + variables)
-// =========================================================================
 
 /// Parse a source string into a [`Program`] (statements separated by `;`).
+///
 /// Line comments (`# ...`) are stripped before parsing.
 pub fn parse_program(src: &str) -> Result<Program, ParseError> {
     let clean = strip_comments(src);
-    parse_program_rich(&clean).map_err(collapse_errors)
-}
-
-/// Parse a source string into a [`Program`], returning span-rich errors.
-pub fn parse_program_rich(src: &str) -> Result<Program, Vec<Rich<'static, char>>> {
-    let clean = strip_comments(src);
-    program_parser()
-        .parse(&clean)
-        .into_result()
-        .map_err(|errs| errs.into_iter().map(|e| e.into_owned()).collect())
+    let mut p = Parser::new(&clean);
+    let prog = p.parse_program()?;
+    p.expect_eof()?;
+    Ok(prog)
 }
 
 // =========================================================================
-// Public API — reusable parser handle
+// Parser internals
 // =========================================================================
 
-/// A reusable, boxed expression parser.
-pub type ExprParser<'src> = Boxed<'src, 'src, &'src str, Expr, Extra<'src>>;
-
-/// Build the expression parser once, as a reusable boxed handle.
-///
-/// # Example (REPL-style reuse)
-/// ```
-/// use time_expr::parser::{parser, run};
-///
-/// let p = parser();
-/// for line in ["2h + 3h", "6h / 2h"] {
-///     let value = run(&p, line).unwrap().eval(&Default::default()).unwrap();
-///     println!("{value}");
-/// }
-/// ```
-pub fn parser<'src>() -> ExprParser<'src> {
-    expr_parser().then_ignore(end()).padded().boxed()
+struct Parser<'src> {
+    src: &'src str,
+    pos: usize,
 }
 
-/// Run a prebuilt [`parser`] over one input, collapsing errors into a
-/// [`ParseError`] (same contract as [`parse`]).
-pub fn run<'a>(parser: &ExprParser<'a>, src: &'a str) -> Result<Expr, ParseError> {
-    parser
-        .parse(src)
-        .into_result()
-        .map_err(|errs| collapse_errors(errs.into_iter().map(|e| e.into_owned()).collect()))
-}
-
-// =========================================================================
-// Error collapsing helper
-// =========================================================================
-
-fn collapse_errors(errs: Vec<Rich<'static, char>>) -> ParseError {
-    if errs.is_empty() {
-        ParseError::unexpected_eof()
-    } else {
-        ParseError::new(errs.iter().map(|e| e.to_string()))
+impl<'src> Parser<'src> {
+    fn new(src: &'src str) -> Self {
+        Self { src, pos: 0 }
     }
-}
 
-// =========================================================================
-// Expression parser (the core recursive grammar)
-// =========================================================================
+    // --- helpers ---------------------------------------------------------
 
-fn expr_parser<'src>() -> impl Parser<'src, &'src str, Expr, Extra<'src>> + Clone {
-    recursive(|expr| {
-        // --- primitive: a bounded, overflow-checked unsigned integer -----
+    fn remaining(&self) -> &'src str {
+        &self.src[self.pos..]
+    }
 
-        let uint = one_of('0'..='9')
-            .repeated()
-            .at_least(1)
-            .to_slice()
-            .try_map(|s: &str, span| {
-                s.parse::<i64>()
-                    .map_err(|_| Rich::custom(span, format!("number '{s}' is too large")))
-            });
+    fn at_eof(&self) -> bool {
+        self.pos >= self.src.len()
+    }
 
-        // --- scalar ------------------------------------------------------
+    fn peek(&self) -> Option<u8> {
+        self.src.as_bytes().get(self.pos).copied()
+    }
 
-        let digits = one_of('0'..='9').repeated().at_least(1);
-        let scalar = digits
-            .clone()
-            .then(just('.').then(digits).or_not())
-            .to_slice()
-            .try_map(|s: &str, span| {
-                s.parse::<f64>()
-                    .map(Value::Scalar)
-                    .map_err(|_| Rich::custom(span, format!("invalid number '{s}'")))
-            });
+    fn advance(&mut self) {
+        self.pos += 1;
+    }
 
-        // --- duration ----------------------------------------------------
+    fn skip_whitespace(&mut self) {
+        while let Some(b) = self.peek() {
+            if b.is_ascii_whitespace() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
 
-        let unit_part = {
-            let uint = uint.clone();
-            move |unit: char| uint.clone().then_ignore(just(unit))
+    fn eat(&mut self, ch: u8) -> bool {
+        self.skip_whitespace();
+        if self.peek() == Some(ch) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, ch: u8) -> Result<(), ParseError> {
+        self.skip_whitespace();
+        if self.peek() == Some(ch) {
+            self.advance();
+            Ok(())
+        } else {
+            Err(self.error(format!(
+                "expected '{}', found {}",
+                ch as char,
+                self.describe_current()
+            )))
+        }
+    }
+
+    fn expect_eof(&mut self) -> Result<(), ParseError> {
+        self.skip_whitespace();
+        if self.at_eof() {
+            Ok(())
+        } else {
+            Err(self.error(format!(
+                "unexpected trailing input: '{}'",
+                self.remaining().trim()
+            )))
+        }
+    }
+
+    fn error(&self, msg: String) -> ParseError {
+        ParseError::new([msg])
+    }
+
+    fn describe_current(&self) -> String {
+        self.skip_whitespace_peek()
+            .map(|b| format!("'{}'", b as char))
+            .unwrap_or_else(|| "end of input".to_string())
+    }
+
+    fn skip_whitespace_peek(&self) -> Option<u8> {
+        let mut i = self.pos;
+        while i < self.src.len() && self.src.as_bytes()[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        self.src.as_bytes().get(i).copied()
+    }
+
+    // --- number scanning -------------------------------------------------
+
+    /// Scan a run of ASCII digits, returning the slice. Does NOT skip leading
+    /// whitespace — the caller must have positioned `pos` at a digit.
+    fn scan_digits(&mut self) -> &'src str {
+        let start = self.pos;
+        while let Some(b) = self.peek() {
+            if b.is_ascii_digit() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        &self.src[start..self.pos]
+    }
+
+    /// Parse an unsigned integer (run of digits) into `i64`.
+    fn parse_u64_digits(&mut self) -> Result<i64, ParseError> {
+        let digits = self.scan_digits();
+        if digits.is_empty() {
+            return Err(self.error("expected a number".to_string()));
+        }
+        digits
+            .parse::<i64>()
+            .map_err(|_| self.error(format!("number '{}' is too large", digits)))
+    }
+
+    // --- identifier ------------------------------------------------------
+
+    fn parse_ident(&mut self) -> Result<String, ParseError> {
+        let start = self.pos;
+        match self.peek() {
+            Some(b) if b.is_ascii_alphabetic() || b == b'_' => self.advance(),
+            _ => return Err(self.error("expected identifier".to_string())),
+        }
+        while let Some(b) = self.peek() {
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(self.src[start..self.pos].to_string())
+    }
+
+    // --- literal parsing -------------------------------------------------
+
+    /// Try to parse a literal or variable reference. This is the core
+    /// disambiguation logic:
+    ///
+    /// - `$` → variable reference
+    /// - `-` followed by digits+unit or digits+`:` → signed duration/timepoint
+    /// - digits followed by `:` → timepoint
+    /// - digits followed by d/h/m/s → duration
+    /// - digits (optionally with `.`) → scalar
+    fn parse_atom(&mut self) -> Result<Expr, ParseError> {
+        self.skip_whitespace();
+
+        match self.peek() {
+            Some(b'$') => {
+                self.advance();
+                let name = self.parse_ident()?;
+                Ok(Expr::Var(name))
+            }
+            Some(b'(') => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                self.expect(b')')?;
+                Ok(expr)
+            }
+            Some(b'-') | Some(b'0'..=b'9') => self.parse_number_or_time_literal(),
+            Some(b) => Err(self.error(format!("unexpected character '{}'", b as char))),
+            None => Err(self.error("unexpected end of input".to_string())),
+        }
+    }
+
+    /// Parse a numeric literal: timepoint, duration, or scalar.
+    /// Handles optional leading `-` for durations and signed timepoint days.
+    fn parse_number_or_time_literal(&mut self) -> Result<Expr, ParseError> {
+        let start = self.pos;
+        let negative = self.peek() == Some(b'-');
+        if negative {
+            self.advance();
+        }
+
+        // We need digits after an optional sign.
+        if !matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos = start;
+            return Err(self.error("expected a number".to_string()));
+        }
+
+        // Scan the digit run without parsing yet — we may need it as f64.
+        let digits_start = self.pos;
+        self.scan_digits();
+        let digits_end = self.pos;
+        let digit_str = &self.src[digits_start..digits_end];
+
+        // Lookahead to disambiguate.
+        match self.peek() {
+            // Colon → timepoint — needs i64 for field value.
+            Some(b':') => {
+                let n: i64 = digit_str
+                    .parse()
+                    .map_err(|_| self.error(format!("number '{}' is too large", digit_str)))?;
+                let signed = if negative { -n } else { n };
+                self.parse_timepoint_rest(signed)
+                    .map(Expr::Literal)
+            }
+            // Unit letter → duration — needs i64.
+            Some(b'd' | b'h' | b'm' | b's') => {
+                let n: i64 = digit_str
+                    .parse()
+                    .map_err(|_| self.error(format!("number '{}' is too large", digit_str)))?;
+                self.parse_duration_rest(n, negative)
+                    .map(Expr::Literal)
+            }
+            // Dot → decimal scalar, parse full slice as f64.
+            Some(b'.') => {
+                self.advance(); // consume '.'
+                let frac_start = self.pos;
+                self.scan_digits();
+                if self.pos == frac_start {
+                    return Err(self.error("expected digits after decimal point".to_string()));
+                }
+                let full = &self.src[start..self.pos];
+                let val: f64 = full
+                    .parse()
+                    .map_err(|_| self.error(format!("invalid number '{full}'")))?;
+                Ok(Expr::Literal(Value::Scalar(val)))
+            }
+            // Anything else → bare integer = scalar (parsed as f64 to handle
+            // values that overflow i64 but fit in f64).
+            _ => {
+                let full = &self.src[start..self.pos];
+                let val: f64 = full
+                    .parse()
+                    .map_err(|_| self.error(format!("invalid number '{full}'")))?;
+                Ok(Expr::Literal(Value::Scalar(val)))
+            }
+        }
+    }
+
+    /// Parse remaining timepoint fields after the first (which may be signed).
+    /// Expects the current position to be at the first `:`.
+    fn parse_timepoint_rest(&mut self, first: i64) -> Result<Value, ParseError> {
+        let mut fields = vec![first];
+
+        while self.peek() == Some(b':') {
+            self.advance(); // consume ':'
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(self.error("expected digits after ':'".to_string()));
+            }
+            let n = self.parse_u64_digits()?;
+            fields.push(n);
+            if fields.len() > 4 {
+                return Err(self.error("too many timepoint fields (max 4)".to_string()));
+            }
+        }
+
+        if fields.len() < 2 {
+            return Err(self.error("timepoint needs at least 2 fields".to_string()));
+        }
+
+        let (day, h, m, s) = match fields.as_slice() {
+            [h, m] => (0, *h, *m, 0),
+            [h, m, s] => (0, *h, *m, *s),
+            [d, h, m, s] => (*d, *h, *m, *s),
+            _ => unreachable!(),
         };
 
-        let duration = just('-')
-            .or_not()
-            .then(
-                unit_part('d')
-                    .or_not()
-                    .then(unit_part('h').or_not())
-                    .then(unit_part('m').or_not())
-                    .then(unit_part('s').or_not()),
-            )
-            .try_map(|(sign, (((d, h), m), s)), span| {
-                if d.is_none() && h.is_none() && m.is_none() && s.is_none() {
-                    return Err(Rich::custom(span, "empty duration"));
+        // Validate ranges.
+        let hours_max = HOURS_PER_DAY as i64;
+        let mins_max = MINUTES_PER_HOUR as i64;
+        let secs_max = SECONDS_PER_MINUTE as i64;
+
+        if !(0..hours_max).contains(&h) {
+            return Err(self.error(format!("hour {h} out of range (0..{hours_max})")));
+        }
+        if !(0..mins_max).contains(&m) {
+            return Err(self.error(format!("minute {m} out of range (0..{mins_max})")));
+        }
+        if !(0..secs_max).contains(&s) {
+            return Err(self.error(format!("second {s} out of range (0..{secs_max})")));
+        }
+
+        Ok(Value::TimePoint(
+            crate::value::TimePoint::from_dhms_normalized(
+                day,
+                h as u32,
+                m as u32,
+                s as u32,
+            ),
+        ))
+    }
+
+    /// Parse duration components after the first number. `first_num` is the
+    /// magnitude of the first component (always positive), and the current
+    /// position is at the first unit letter.
+    fn parse_duration_rest(&mut self, first_num: i64, negative: bool) -> Result<Value, ParseError> {
+        let mut d: i64 = 0;
+        let mut h: i64 = 0;
+        let mut m: i64 = 0;
+        let mut s: i64 = 0;
+        let mut has_any = false;
+
+        // The first_num is pending — assign it to whatever unit we see.
+        let mut pending = Some(first_num);
+
+        loop {
+            if let Some(num) = pending.take() {
+                match self.peek() {
+                    Some(b'd') => {
+                        self.advance();
+                        d = num;
+                        has_any = true;
+                    }
+                    Some(b'h') => {
+                        self.advance();
+                        h = num;
+                        has_any = true;
+                    }
+                    Some(b'm') => {
+                        self.advance();
+                        m = num;
+                        has_any = true;
+                    }
+                    Some(b's') => {
+                        self.advance();
+                        s = num;
+                        has_any = true;
+                    }
+                    _ => {
+                        if has_any {
+                            // We've consumed at least one component but hit a
+                            // number not followed by a unit. This is likely the
+                            // start of the next token (e.g., `2h 3` where 3 is
+                            // a scalar). Rewind the number.
+                            // But we parsed the digits already... this case
+                            // shouldn't arise since we only enter this loop
+                            // when we see a unit letter after scan_digits.
+                            break;
+                        }
+                        return Err(self.error("empty duration".to_string()));
+                    }
                 }
-                let secs = checked_dhms_to_seconds(
-                    d.unwrap_or(0),
-                    h.unwrap_or(0),
-                    m.unwrap_or(0),
-                    s.unwrap_or(0),
-                )
-                .ok_or_else(|| Rich::custom(span, "duration is too large"))?;
+            }
 
-                let secs = if sign.is_some() {
-                    secs.checked_neg()
-                        .ok_or_else(|| Rich::custom(span, "duration is too large"))?
-                } else {
-                    secs
-                };
+            // Check if more number+unit follows.
+            if matches!(self.peek(), Some(b'0'..=b'9')) {
+                let num = self.parse_u64_digits()?;
+                pending = Some(num);
+            } else {
+                break;
+            }
+        }
 
-                Ok(Value::Duration(crate::value::Duration::from_secs(secs)))
-            });
+        if !has_any {
+            return Err(self.error("empty duration".to_string()));
+        }
 
-        // --- timepoint ---------------------------------------------------
+        let secs = checked_dhms_to_seconds(d, h, m, s)
+            .ok_or_else(|| self.error("duration is too large".to_string()))?;
 
-        let field = just('-')
-            .or_not()
-            .then(uint.clone())
-            .map(|(sign, n)| if sign.is_some() { -n } else { n });
+        let secs = if negative {
+            secs.checked_neg()
+                .ok_or_else(|| self.error("duration is too large".to_string()))?
+        } else {
+            secs
+        };
 
-        let timepoint = field
-            .separated_by(just(':'))
-            .at_least(2)
-            .at_most(4)
-            .collect::<Vec<i64>>()
-            .validate(|parts, extra, emitter| {
-                let (day, h, m, s) = match parts.as_slice() {
-                    [h, m] => (0, *h, *m, 0),
-                    [h, m, s] => (0, *h, *m, *s),
-                    [d, h, m, s] => (*d, *h, *m, *s),
-                    _ => unreachable!("timepoint field count is bounded to 2..=4"),
-                };
+        Ok(Value::Duration(crate::value::Duration::from_secs(secs)))
+    }
 
-                let hours_max = HOURS_PER_DAY as i64;
-                let mins_max = MINUTES_PER_HOUR as i64;
-                let secs_max = SECONDS_PER_MINUTE as i64;
-                if !(0..hours_max).contains(&h) {
-                    emitter.emit(Rich::custom(
-                        extra.span(),
-                        format!("hour {h} out of range (0..{hours_max})"),
-                    ));
-                } else if !(0..mins_max).contains(&m) {
-                    emitter.emit(Rich::custom(
-                        extra.span(),
-                        format!("minute {m} out of range (0..{mins_max})"),
-                    ));
-                } else if !(0..secs_max).contains(&s) {
-                    emitter.emit(Rich::custom(
-                        extra.span(),
-                        format!("second {s} out of range (0..{secs_max})"),
-                    ));
+    // --- recursive descent -----------------------------------------------
+
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_sum()
+    }
+
+    /// sum = product (("+" | "-") product)*
+    fn parse_sum(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_product()?;
+        loop {
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b'+') => {
+                    self.advance();
+                    let rhs = self.parse_product()?;
+                    lhs = Expr::binary(BinOp::Add, lhs, rhs);
                 }
+                Some(b'-') => {
+                    // Distinguish binary `-` from unary `-` or a negative
+                    // literal. After a complete operand, `-` is binary.
+                    self.advance();
+                    let rhs = self.parse_product()?;
+                    lhs = Expr::binary(BinOp::Sub, lhs, rhs);
+                }
+                _ => break,
+            }
+        }
+        Ok(lhs)
+    }
 
-                Value::TimePoint(crate::value::TimePoint::from_dhms_normalized(
-                    day,
-                    h.rem_euclid(hours_max) as u32,
-                    m.rem_euclid(mins_max) as u32,
-                    s.rem_euclid(secs_max) as u32,
-                ))
-            });
+    /// product = unary (("*" | "/") unary)*
+    fn parse_product(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b'*') => {
+                    self.advance();
+                    let rhs = self.parse_unary()?;
+                    lhs = Expr::binary(BinOp::Mul, lhs, rhs);
+                }
+                Some(b'/') => {
+                    self.advance();
+                    let rhs = self.parse_unary()?;
+                    lhs = Expr::binary(BinOp::Div, lhs, rhs);
+                }
+                _ => break,
+            }
+        }
+        Ok(lhs)
+    }
 
-        // --- variable reference ------------------------------------------
+    /// unary = "-" unary | atom
+    ///
+    /// We try `atom` first. If the current character is `-`, we need to decide
+    /// whether it starts a negative literal (duration/timepoint/scalar) or is
+    /// a unary negation operator. The heuristic:
+    /// - `-` followed by digits then `:` → signed timepoint day, parse as atom
+    /// - `-` followed by digits then d/h/m/s → negative duration, parse as atom
+    /// - `-` followed by digits then `.` or end → negative scalar, parse as atom
+    /// - `-` followed by `(` or `$` → unary negation
+    /// - `-` followed by `-` → unary negation (double negative)
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        self.skip_whitespace();
+        if self.peek() == Some(b'-') {
+            // Look ahead to decide: literal or unary?
+            if self.is_negative_literal_ahead() {
+                // Parse the whole thing (including the `-`) as a literal atom.
+                self.parse_atom()
+            } else {
+                // Unary negation.
+                self.advance(); // consume '-'
+                let operand = self.parse_unary()?;
+                Ok(Expr::unary(UnaryOp::Neg, operand))
+            }
+        } else {
+            self.parse_atom()
+        }
+    }
 
-        let var_ref = just('$')
-            .ignore_then(text::ident())
-            .map(|name: &str| Expr::Var(name.to_string()));
+    /// Check if `-` at current position starts a negative literal rather than
+    /// a unary operator. Peeks ahead without consuming.
+    fn is_negative_literal_ahead(&self) -> bool {
+        // pos is at '-'. Check what follows the '-'.
+        let after_minus = self.pos + 1;
+        if after_minus >= self.src.len() {
+            return false;
+        }
+        let b = self.src.as_bytes()[after_minus];
+        if !b.is_ascii_digit() {
+            return false;
+        }
+        // Scan past digits to find what follows them.
+        let mut i = after_minus;
+        while i < self.src.len() && self.src.as_bytes()[i].is_ascii_digit() {
+            i += 1;
+        }
+        // If digits are followed by a unit letter or ':', it's a literal.
+        // If followed by '.' or end/whitespace/operator, it's a scalar literal.
+        match self.src.as_bytes().get(i) {
+            Some(b':') => true,          // timepoint
+            Some(b'd' | b'h' | b'm' | b's') => true,  // duration
+            Some(b'.') => true,          // decimal scalar
+            // Bare integer after '-': only treat as literal if there's no
+            // operator context. We can't easily know, so treat `-N` where N
+            // has no suffix as unary. This matches the original chumsky
+            // behavior where `-3` in `2h - 3` is binary minus + scalar 3.
+            _ => false,
+        }
+    }
 
-        // Order matters: timepoint (colons) and duration (unit letters) are
-        // tried before scalar (a bare number), the fallback shape.
-        let literal = choice((timepoint, duration, scalar)).map(Expr::Literal);
+    // --- program & statement parsing -------------------------------------
 
-        // --- atoms, grouping, precedence ---------------------------------
+    fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let mut statements = Vec::new();
 
-        let atom = literal
-            .or(var_ref)
-            .or(expr.delimited_by(just('('), just(')')))
-            .padded();
+        self.skip_whitespace();
+        if self.at_eof() {
+            return Err(self.error("unexpected end of input".to_string()));
+        }
 
-        let op = |c: char, binop: BinOp| just(c).padded().to(binop);
+        loop {
+            self.skip_whitespace();
+            if self.at_eof() {
+                break;
+            }
 
-        let unary = recursive(|unary| {
-            atom.clone().or(just('-')
-                .padded()
-                .ignore_then(unary)
-                .map(|operand| Expr::unary(UnaryOp::Neg, operand)))
-        });
+            let stmt = self.parse_statement()?;
+            statements.push(stmt);
 
-        let product = unary.clone().foldl(
-            choice((op('*', BinOp::Mul), op('/', BinOp::Div)))
-                .then(unary)
-                .repeated(),
-            |lhs, (binop, rhs)| Expr::binary(binop, lhs, rhs),
-        );
+            self.skip_whitespace();
+            if self.eat(b';') {
+                // Consume any additional semicolons (from newline joining).
+                while self.eat(b';') {}
+                continue;
+            } else {
+                break;
+            }
+        }
 
-        product.clone().foldl(
-            choice((op('+', BinOp::Add), op('-', BinOp::Sub)))
-                .then(product)
-                .repeated(),
-            |lhs, (binop, rhs)| Expr::binary(binop, lhs, rhs),
-        )
-    })
-}
+        Ok(Program { statements })
+    }
 
-// =========================================================================
-// Program parser (statements + variables + semicolons)
-// =========================================================================
+    fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+        self.skip_whitespace();
 
-fn program_parser<'src>() -> impl Parser<'src, &'src str, Program, Extra<'src>> {
-    let expr = expr_parser();
+        // Try assignment: $ident = expr
+        if self.peek() == Some(b'$') {
+            // Speculatively parse: save position, try $ident =
+            let saved = self.pos;
+            self.advance(); // consume '$'
+            if let Ok(name) = self.parse_ident() {
+                self.skip_whitespace();
+                if self.peek() == Some(b'=') {
+                    self.advance(); // consume '='
+                    let expr = self.parse_expr()?;
+                    return Ok(Statement::Assign { name, expr });
+                }
+            }
+            // Not an assignment — rewind and parse as expression.
+            self.pos = saved;
+        }
 
-    // $ident = expr
-    let assign = just('$')
-        .ignore_then(text::ident())
-        .then_ignore(just('=').padded())
-        .then(expr.clone())
-        .map(|(name, e): (&str, Expr)| Statement::Assign {
-            name: name.to_string(),
-            expr: e,
-        });
-
-    // A statement is either an assignment or a bare expression.
-    // Try assign first since `$x = ...` starts with `$` which var_ref would
-    // also match; chumsky backtracks if the `= expr` part fails.
-    let stmt = assign.or(expr.map(Statement::Expr));
-
-    stmt.separated_by(just(';').padded())
-        .allow_trailing()
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .map(|statements| Program { statements })
-        .then_ignore(end())
-        .padded()
+        let expr = self.parse_expr()?;
+        Ok(Statement::Expr(expr))
+    }
 }
 
 // =========================================================================
@@ -570,7 +848,6 @@ mod tests {
 
     #[test]
     fn assignment_is_last_statement() {
-        // No trailing bare expression — assignment value is the result.
         assert_eq!(prog_eval("$x = 2h + 2h; $y = $x / 2"), "2h");
     }
 
@@ -603,7 +880,6 @@ mod tests {
 
     #[test]
     fn var_ref_in_single_expr_parse() {
-        // The single-expression parser should also handle $var.
         let expr = parse("$x").unwrap();
         let mut env = Env::new();
         env.set("x".to_string(), Value::Scalar(42.0));

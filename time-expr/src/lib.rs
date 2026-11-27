@@ -7,9 +7,9 @@
 //! `TimePoint - TimePoint` yields a `Duration`, but `TimePoint + TimePoint`
 //! is a type error).
 //!
-//! The [`parser`] turns source text into an [`ast::Expr`] tree, which
-//! [`ast::Expr::eval`] reduces to a [`Value`](value::Value). Rich parse
-//! diagnostics are available behind the `diagnostics` feature.
+//! The [`parser`] turns source text into an [`ast::Expr`] tree (or a
+//! [`ast::Program`] with variables and `;`-separated statements), which
+//! evaluates to a [`Value`](value::Value).
 
 pub mod ast;
 pub mod error;
@@ -19,17 +19,11 @@ pub mod value;
 
 mod helpers;
 
-#[cfg(feature = "diagnostics")]
-pub mod diagnostics;
-
 /// Common imports for consumers of the library.
 pub mod prelude {
     pub use crate::ast::{Env, Expr, Program, Statement};
     pub use crate::error::{EvalError, ParseError, TimeExprError};
     pub use crate::op::BinOp;
-    pub use crate::parser::{parse, parse_program, parse_rich};
+    pub use crate::parser::{parse, parse_program};
     pub use crate::value::Value;
-
-    #[cfg(feature = "diagnostics")]
-    pub use crate::diagnostics::report;
 }
